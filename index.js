@@ -272,7 +272,7 @@ app.all('/', function(req, res) {
 
 
 // this route is used when setting up a panel to return possible measurements
-app.all('/search', function(req, res){
+app.all('/search', function(req, res) {
   setHeaders(res);
 
   let result = [];
@@ -286,7 +286,17 @@ app.all('/search', function(req, res){
       result.push({text: k, value: v});
     });
   } else {
-    // TODO
+    const r = new RegExp(searchValue, 'i');
+    _.map(PROCESS_MEASUREMENTS, function(k, v) {
+      if (k.match(r)) {
+        result.push({text: k, value: v});
+      }
+    });
+    _.map(DISK_MEASUREMENTS, function(k, v) {
+      if (k.match(r)) {
+        result.push({text: k, value: v});
+      }
+    });
   }
 
   res.json(result);
