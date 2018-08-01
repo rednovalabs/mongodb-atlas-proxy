@@ -5,12 +5,16 @@ var app = express();
 var request = require('request-promise-native');
 var morgan = require('morgan');
 var S = require('string');
+var memjs = require('memjs');
 
 
 const CONFIG = {
   atlas_username: process.env.ATLAS_USERNAME,
   atlas_api_key: process.env.ATLAS_API_KEY,
-  port: process.env.PORT || 3333
+  port: process.env.PORT || 3333,
+  memcached_server: process.env.MEMCACHEDCLOUD_SERVERS,
+  memcached_username: process.env.MEMCACHEDCLOUD_USERNAME,
+  memcached_password: process.env.MEMCACHEDCLOUD_PASSWORD
 }
 
 const PROCESS_MEASUREMENT_VALUES = [
@@ -111,12 +115,40 @@ _.each(DISK_MEASUREMENT_VALUES, function(m) {
   DISK_MEASUREMENTS[m] = S(m).humanize().s;
 })
 
+const MEMCACHED = memjs.Client.create(CONFIG.memcached_server, {
+  username: CONFIG.memcached_username,
+  password: CONFIG.memcached_password
+});
+
 
 function setHeaders(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST");
   res.setHeader("Access-Control-Allow-Headers", "accept, content-type");
   res.setHeader("Content-Type", "application/json; charset=utf-8");
+}
+
+async function cacheGet(key) {
+  try {
+    let response = await MEMCACHED.get(key);
+    if (response.value) {
+      return JSON.parse(response.value);
+    } else {
+      return null;
+    }
+  } catch (err) {
+    // we don't care if we can't connect
+    return null;
+  }
+}
+
+async function cachePut(key, value, options) {
+  try {
+    return await MEMCACHED.set(key, JSON.stringify(value), options);
+  } catch (err) {
+    // we don't care if we can't connect
+    return null;
+  }
 }
 
 function requestFromAtlas(path, options) {
@@ -142,46 +174,39 @@ function requestFromAtlas(path, options) {
 }
 
 function getMongoHosts(req) {
-  return new Promise(function(resolve, reject) {
-    var useCache = false;
-    var responseFromCache = false;
+  const url = `/groups/${req.auth.projectId}/clusters/${req.auth.clusterName}`;
 
-    if (useCache) {
-      // TODO: figure out caching
-      responseFromCache = true;
-      // resolve(mongos);
-    }
-
-    if (!responseFromCache) {
-      requestFromAtlas(`/groups/${req.auth.projectId}/clusters/${req.auth.clusterName}`).then(function(response) {
-        const mongos = mongosFromURI(response.body.mongoURI)
-        resolve(mongos);
+  return cacheGet(url).then(function(mongos) {
+    if (mongos) {
+      return mongos;
+    } else {
+      return requestFromAtlas(url).then(function(response) {
+        const mongos = mongosFromURI(response.body.mongoURI);
+        cachePut(url, mongos, {expires: 900});
+        return mongos;
       }).catch(function(error) {
-        reject(error.error || error);
+        throw (error.error || error);
       });
     }
   });
 }
 
 function getDiskNames(req, mongo) {
-  return new Promise(function(resolve, reject) {
-    var useCache = false;
-    var responseFromCache = false;
+  const url = `/groups/${req.auth.projectId}/processes/${mongo}/disks`;
 
-    if (useCache) {
-      // TODO: figure out caching
-      responseFromCache = true;
-      // resolve(mongos);
-    }
-
-    if (!responseFromCache) {
-      requestFromAtlas(`/groups/${req.auth.projectId}/processes/${mongo}/disks`).then(function(response) {
-        resolve({
+  return cacheGet(url).then(function(disks) {
+    if (disks) {
+      return disks;
+    } else {
+      return requestFromAtlas(url).then(function(response) {
+        const disks = {
           name: mongo,
           disks: response.body.results.map((r) => r.partitionName)
-        });
+        };
+        cachePut(url, disks, {expires: 900});
+        return disks;
       }).catch(function(error) {
-        reject(error.error || error);
+        return (error.error || error);
       });
     }
   });
@@ -217,6 +242,9 @@ function timestampToEpoch(timestamp) {
 
 
 //****************************         MIDDLEWARE
+// before request logger
+app.use(morgan('dev', {immediate: true}));
+// after request logger
 app.use(morgan('combined'));
 app.use(express.json());
 app.use(authorizationParser);

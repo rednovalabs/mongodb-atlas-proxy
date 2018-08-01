@@ -8,6 +8,7 @@
     "dotenv": "^6.0.0",
     "express": "^4.16.3",
     "lodash": "^4.17.10",
+    "memjs": "^1.2.0",
     "morgan": "^1.9.0",
     "request": "^2.87.0",
     "request-promise-native": "^1.0.5",
