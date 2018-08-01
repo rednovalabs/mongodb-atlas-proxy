@@ -1,5 +1,4 @@
 require('dotenv').config();
-
 var express = require('express');
 var _ = require('lodash');
 var app = express();
@@ -8,12 +7,10 @@ var morgan = require('morgan');
 var S = require('string');
 
 
-
-
-
 const CONFIG = {
   atlas_username: process.env.ATLAS_USERNAME,
-  atlas_api_key: process.env.ATLAS_API_KEY
+  atlas_api_key: process.env.ATLAS_API_KEY,
+  port: process.env.PORT || 3333
 }
 
 const PROCESS_MEASUREMENT_VALUES = [
@@ -90,15 +87,32 @@ const PROCESS_MEASUREMENT_VALUES = [
   'SYSTEM_NORMALIZED_CPU_SOFTIRQ',
   'SYSTEM_NORMALIZED_CPU_GUEST',
   'SYSTEM_NORMALIZED_CPU_STEAL'
-]
-
+];
 var PROCESS_MEASUREMENTS = {};
 _.each(PROCESS_MEASUREMENT_VALUES, function(m) {
   PROCESS_MEASUREMENTS[m] = S(m).humanize().s;
 })
 
+const DISK_MEASUREMENT_VALUES = [
+  'DISK_PARTITION_IOPS_READ',
+  'DISK_PARTITION_IOPS_WRITE',
+  'DISK_PARTITION_IOPS_TOTAL',
+  'DISK_PARTITION_UTILIZATION',
+  'DISK_PARTITION_LATENCY_READ',
+  'DISK_PARTITION_LATENCY_WRITE',
+  'DISK_PARTITION_SPACE_FREE',
+  'DISK_PARTITION_SPACE_USED',
+  'DISK_PARTITION_SPACE_PERCENT_FREE',
+  'DISK_PARTITION_SPACE_PERCENT_USED'
+];
 
-function setCORSHeaders(res) {
+var DISK_MEASUREMENTS = {};
+_.each(DISK_MEASUREMENT_VALUES, function(m) {
+  DISK_MEASUREMENTS[m] = S(m).humanize().s;
+})
+
+
+function setHeaders(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST");
   res.setHeader("Access-Control-Allow-Headers", "accept, content-type");
@@ -107,6 +121,7 @@ function setCORSHeaders(res) {
 
 function requestFromAtlas(path, options) {
   if (options) {
+    // we have to do this madness because multiple measurements get specified with the same query string key
     const queryString = _.map(options, function(optPair) {
       return optPair.join('=');
     }).join('&');
@@ -126,7 +141,7 @@ function requestFromAtlas(path, options) {
   });
 }
 
-function getShardNames(req) {
+function getMongoHosts(req) {
   return new Promise(function(resolve, reject) {
     var useCache = false;
     var responseFromCache = false;
@@ -142,7 +157,31 @@ function getShardNames(req) {
         const mongos = mongosFromURI(response.body.mongoURI)
         resolve(mongos);
       }).catch(function(error) {
-        reject(error.error, error.statusCode);
+        reject(error.error || error);
+      });
+    }
+  });
+}
+
+function getDiskNames(req, mongo) {
+  return new Promise(function(resolve, reject) {
+    var useCache = false;
+    var responseFromCache = false;
+
+    if (useCache) {
+      // TODO: figure out caching
+      responseFromCache = true;
+      // resolve(mongos);
+    }
+
+    if (!responseFromCache) {
+      requestFromAtlas(`/groups/${req.auth.projectId}/processes/${mongo}/disks`).then(function(response) {
+        resolve({
+          name: mongo,
+          disks: response.body.results.map((r) => r.partitionName)
+        });
+      }).catch(function(error) {
+        reject(error.error || error);
       });
     }
   });
@@ -160,7 +199,6 @@ function authorizationParser(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!_.isEmpty(authHeader)) {
     const auth = Buffer.from(authHeader.split(' ')[1], 'base64').toString().split(':');
-    // username is not used (yet?)
     req.auth = {clusterName: auth[0], projectId: auth[1]};
   } else {
     req.auth = {};
@@ -195,9 +233,9 @@ app.use(authorizationParser);
 
 // this route is used when saving a datasource to test if it can authorize
 app.all('/', function(req, res) {
-  setCORSHeaders(res);
+  setHeaders(res);
 
-  getShardNames(req).then(function(mongos) {
+  getMongoHosts(req).then(function(mongos) {
     res.status(200).json(mongos).end();
   }).catch(function(error) {
     res.status(401).json(error).end();
@@ -207,14 +245,16 @@ app.all('/', function(req, res) {
 
 // this route is used when setting up a panel to return possible measurements
 app.all('/search', function(req, res){
-  setCORSHeaders(res);
-  console.log(req.body);
+  setHeaders(res);
 
   let result = [];
 
   const searchValue = req.body.target;
   if (_.isEmpty(searchValue)) {
     _.map(PROCESS_MEASUREMENTS, function(k, v) {
+      result.push({text: k, value: v});
+    });
+    _.map(DISK_MEASUREMENTS, function(k, v) {
       result.push({text: k, value: v});
     });
   } else {
@@ -226,33 +266,30 @@ app.all('/search', function(req, res){
 });
 
 
+
+
+function getDisks(diskTargets, req, mongos) {
+  if (_.isEmpty(diskTargets)) {
+    return Promise.resolve([]);
+  } else {
+    return Promise.all(mongos.map(function(mongo) {
+      return getDiskNames(req, mongo);
+    }));
+  }
+}
 // this route actually queries the Atlas API for data
 app.all('/query', function(req, res){
-  setCORSHeaders(res);
-  // console.log(req.url);
+  setHeaders(res);
+
   // console.log(req.body);
 
+  const allTargets = _.map(req.body.targets, 'target');
+  const hostTargets = _.filter(allTargets, (t) => _.includes(PROCESS_MEASUREMENT_VALUES, t));
+  const diskTargets = _.filter(allTargets, (t) => _.includes(DISK_MEASUREMENT_VALUES, t));
 
-
-// { timezone: 'browser',
-//   panelId: 2,
-//   dashboardId: 146,
-//   range:
-//    { from: '2018-07-31T09:00:24.531Z',
-//      to: '2018-07-31T15:00:24.532Z',
-//      raw: { from: 'now-6h', to: 'now' } },
-//   rangeRaw: { from: 'now-6h', to: 'now' },
-//   interval: '30s',
-//   intervalMs: 30000,
-//   targets: [ { target: 'CONNECTIONS', refId: 'A', type: 'timeserie' } ],
-//   maxDataPoints: 863,
-//   scopedVars:
-//    { __interval: { text: '30s', value: '30s' },
-//      __interval_ms: { text: 30000, value: 30000 } },
-//   adhocFilters: [] }
-
-  const intervalSeconds = req.body.intervalMs / 1000;
+  // https://docs.atlas.mongodb.com/reference/api/process-measurements/#request-query-parameters
   let granularity = null;
+  const intervalSeconds = req.body.intervalMs / 1000;
   if (intervalSeconds <= 60) {
     granularity = 'PT1M';
   } else if (intervalSeconds <= 500) {
@@ -263,107 +300,67 @@ app.all('/query', function(req, res){
     granularity = 'PT1D';
   }
 
-  let atlasRequestOptions = [
+  const baseAtlasRequestOptions = [
     ['start', req.body.range.from],
     ['end', req.body.range.to],
     ['granularity', granularity]
   ];
-  _.each(req.body.targets, function(target) {
-    atlasRequestOptions.push(['m', target.target]);
-  });
 
-  // TODO: cache the cluster names somewhere
-  getShardNames(req).then(function(mongos) {
-    const requests = _.map(mongos, function(shard) {
-      return requestFromAtlas(`/groups/${req.auth.projectId}/processes/${shard}/measurements`, atlasRequestOptions);
-    });
 
-    Promise.all(requests).then(function(responses) {
-      let results = [];
 
-      _.each(responses, function(response) {
-        _.each(response.body.measurements, function(measurement) {
-          let result = {
-            target: `${PROCESS_MEASUREMENTS[measurement.name]} (${response.body.processId})`,
-            datapoints: []
-          };
-          _.each(measurement.dataPoints, function(dataPoint) {
-            // TODO: why are we getting so many null values??
-            if (dataPoint.value) {
-              result.datapoints.push([dataPoint.value, timestampToEpoch(dataPoint.timestamp)]);
-            }
-          });
-          results.push(result);
+  getMongoHosts(req).then(function(mongos) {
+    return getDisks(diskTargets, req, mongos).then(function(mongoDisks) {
+      let requests = [];
+
+      if (!_.isEmpty(diskTargets)) {
+        let atlasRequestOptions = _.clone(baseAtlasRequestOptions);
+        _.each(diskTargets, function(target) {
+          atlasRequestOptions.push(['m', target]);
         });
-      });
+        mongoDisks.map(function(mongoDisk) {
+          mongoDisk.disks.map(function(disk) {
+            requests.push(requestFromAtlas(`/groups/${req.auth.projectId}/processes/${mongoDisk.name}/disks/${disk}/measurements`, atlasRequestOptions));
+          });
+        });
+      }
 
-      res.json(results).end();
-    }).catch(function(error, statusCode) {
-      res.status(statusCode).json(error).end();
+      if (!_.isEmpty(hostTargets)) {
+        let atlasRequestOptions = _.clone(baseAtlasRequestOptions);
+        _.each(hostTargets, function(target) {
+          atlasRequestOptions.push(['m', target]);
+        });
+        mongos.map(function(mongo) {
+          requests.push(requestFromAtlas(`/groups/${req.auth.projectId}/processes/${mongo}/measurements`, atlasRequestOptions));
+        });
+      }
+
+      return Promise.all(requests);
     });
-  }).catch(function(error, statusCode) {
-    res.status(statusCode).json(error).end();
+  }).then(function(responses) {
+    let results = [];
+
+    _.each(responses, function(response) {
+      _.each(response.body.measurements, function(measurement) {
+        let result = {
+          target: `${PROCESS_MEASUREMENTS[measurement.name] || DISK_MEASUREMENTS[measurement.name]} (${response.body.processId})`,
+          datapoints: []
+        };
+        _.each(measurement.dataPoints, function(dataPoint) {
+          // TODO: why are we getting so many null values??
+          if (dataPoint.value) {
+            result.datapoints.push([dataPoint.value, timestampToEpoch(dataPoint.timestamp)]);
+          }
+        });
+        results.push(result);
+      });
+    });
+
+    res.json(results).end();
+  }).catch(function(error) {
+    console.log("ERROR:", error);
+    res.status(500).json(error).end();
   });
-
-
-
-  // 'groups/{GROUP-ID}/processes/{HOST}:{PORT}/measurements'
-  // 'groups/{GROUP-ID}/processes/{HOST}:{PORT}/disks/{DISK-NAME}/measurements'
 });
 
-
-
-// app.all('/annotations', function(req, res) {
-//   setCORSHeaders(res);
-//   console.log(req.url);
-//   console.log(req.body);
-//
-//   var annotation = {
-//     name : "annotation name",
-//     enabled: true,
-//     datasource: "generic datasource",
-//     showLine: true,
-//   }
-//   var annotations = [
-//     { annotation: annotation, "title": "Donlad trump is kinda funny", "time": 1450754160000, text: "teeext", tags: "taaags" },
-//     { annotation: annotation, "title": "Wow he really won", "time": 1450754160000, text: "teeext", tags: "taaags" },
-//     { annotation: annotation, "title": "When is the next ", "time": 1450754160000, text: "teeext", tags: "taaags" }
-//   ];
-//
-//   res.json(annotations);
-//   res.end();
-// });
-// app.all('/tag-keys', function(req, res) {
-//   setCORSHeaders(res);
-//   console.log(req.url);
-//   console.log(req.body);
-//
-//   var v = [
-//       {"type":"string","text":"City"},
-//       {"type":"string","text":"Country"}
-//   ]
-//
-//   res.json(v);
-//   res.end();
-// });
-//
-// app.all('/tag-values', function(req, res) {
-//   setCORSHeaders(res);
-//   console.log(req.url);
-//   console.log(req.body);
-//
-//   var v = [
-//       {'text': 'Eins!'},
-//       {'text': 'Zwei'},
-//       {'text': 'Drei!'}
-//   ]
-//
-//   res.json(v);
-//   res.end();
-// });
-
-
-
-app.listen(3333);
-
-console.log("Server is listening to port 3333");
+app.listen(CONFIG.port);
+console.log(`Server is listening to port ${CONFIG.port}`);
